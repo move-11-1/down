@@ -24,6 +24,17 @@ jobs:
           sudo apt-get install -y ffmpeg zip
           pip install --quiet --upgrade yt-dlp requests
 
+      - name: 🍪 Setup YouTube cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > /tmp/cookies.txt
+            echo "✅ YouTube cookies loaded"
+          else
+            echo "⚠️ No cookies found - YouTube may block downloads"
+          fi
+
       - name: 🎬 Download → ZIP → Release → Update videos.txt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,6 +58,7 @@ jobs:
               "Authorization": f"token {GH_TOKEN}",
               "Accept": "application/vnd.github.v3+json"
           }
+          COOKIES_FILE = "/tmp/cookies.txt" if Path("/tmp/cookies.txt").exists() else None
 
           # ── Read links.txt ───────────────────────────────
           links = []
@@ -123,7 +135,11 @@ jobs:
                           "merge_output_format": "mp4",
                           "quiet": False,
                           "postprocessors": [{"key":"FFmpegVideoConvertor","preferedformat":"mp4"}],
+                          "extractor_args": {"youtube": {"player_client": ["android","web"]}},
                       }
+                      if COOKIES_FILE:
+                          opts["cookiefile"] = COOKIES_FILE
+                          print("  🍪 Using cookies")
                       with yt_dlp.YoutubeDL(opts) as ydl:
                           info = ydl.extract_info(url, download=True)
                           title = info.get("title", f"video_{i}")
