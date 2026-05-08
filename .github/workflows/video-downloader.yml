@@ -1,0 +1,275 @@
+name: 🎬 Video Downloader → GitHub Release
+
+on:
+  push:
+    paths:
+      - 'links.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # repo-তে commit করার জন্য
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🔧 Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg zip
+          pip install --quiet --upgrade yt-dlp requests
+
+      - name: 🎬 Download → ZIP → Release → Update videos.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          python3 << 'PYEOF'
+          import os, sys, uuid, json, zipfile, subprocess, requests
+          from pathlib import Path
+          from datetime import datetime, timedelta
+          from urllib.parse import urlparse, unquote
+
+          # ── Config ───────────────────────────────────────
+          DOWNLOAD_DIR = Path("/tmp/videos")
+          DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+          GH_TOKEN   = os.environ["GH_TOKEN"]
+          REPO_OWNER = os.environ["REPO_OWNER"]
+          REPO_NAME  = os.environ["REPO_NAME"]
+          GITHUB_MAX = 2_000_000_000  # 2 GB safe limit
+          GH_HEADERS = {
+              "Authorization": f"token {GH_TOKEN}",
+              "Accept": "application/vnd.github.v3+json"
+          }
+
+          # ── Read links.txt ───────────────────────────────
+          links = []
+          with open("links.txt") as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      links.append(line)
+
+          if not links:
+              print("❌ links.txt-এ কোনো link নেই!")
+              sys.exit(0)
+
+          print(f"✅ {len(links)}টি link পাওয়া গেছে\n")
+
+          # ── Helpers ──────────────────────────────────────
+          def is_youtube(url):
+              return "youtube.com" in url or "youtu.be" in url
+
+          def get_duration(path):
+              try:
+                  r = subprocess.run(
+                      ["ffprobe","-v","error","-show_entries","format=duration",
+                       "-of","default=noprint_wrappers=1:nokey=1", str(path)],
+                      capture_output=True, text=True)
+                  return float(r.stdout.strip())
+              except:
+                  return 0
+
+          def compress_if_needed(src: Path) -> Path:
+              # Remux to MP4 if needed
+              if src.suffix.lower() != ".mp4":
+                  out = src.with_suffix(".mp4")
+                  subprocess.run(
+                      ["ffmpeg","-y","-i",str(src),"-c","copy",
+                       "-movflags","+faststart",str(out)],
+                      capture_output=True)
+                  if out.exists() and out.stat().st_size > 0:
+                      src = out
+
+              if src.stat().st_size <= GITHUB_MAX:
+                  return src
+
+              # Compress to fit GitHub limit
+              dur = get_duration(src)
+              out = src.parent / (src.stem + "_compressed.mp4")
+              if dur > 0:
+                  vbr = max(int((1_750_000_000 * 8 / dur - 128_000) / 1000), 400)
+                  cmd = ["ffmpeg","-y","-i",str(src),
+                         "-c:v","libx264","-b:v",f"{vbr}k","-preset","ultrafast",
+                         "-c:a","aac","-b:a","128k","-movflags","+faststart",str(out)]
+              else:
+                  cmd = ["ffmpeg","-y","-i",str(src),
+                         "-c:v","libx264","-crf","28","-preset","ultrafast",
+                         "-c:a","aac","-b:a","128k","-movflags","+faststart",str(out)]
+              print(f"  ⏳ Compressing {src.name}...")
+              subprocess.run(cmd, capture_output=True)
+              return out if (out.exists() and out.stat().st_size > 0) else src
+
+          # ── Download all links ────────────────────────────
+          downloaded = []  # list of (Path, title)
+
+          for i, url in enumerate(links, 1):
+              print(f"\n{'='*60}")
+              print(f"[{i}/{len(links)}] {url}")
+              print('='*60)
+
+              if is_youtube(url):
+                  try:
+                      import yt_dlp
+                      opts = {
+                          "format": "bestvideo[height<=1080]+bestaudio/best",
+                          "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+                          "merge_output_format": "mp4",
+                          "quiet": False,
+                          "postprocessors": [{"key":"FFmpegVideoConvertor","preferedformat":"mp4"}],
+                      }
+                      with yt_dlp.YoutubeDL(opts) as ydl:
+                          info = ydl.extract_info(url, download=True)
+                          title = info.get("title", f"video_{i}")
+                      already = {p for p, _ in downloaded}
+                      new_files = [p for p in sorted(DOWNLOAD_DIR.glob("*.mp4"),
+                                   key=lambda x: x.stat().st_mtime) if p not in already]
+                      if new_files:
+                          downloaded.append((new_files[-1], title))
+                          print(f"  ✅ {new_files[-1].name}")
+                      else:
+                          print("  ⚠️ File not found after download")
+                  except Exception as e:
+                      print(f"  ❌ Error: {e}")
+
+              else:
+                  try:
+                      r = requests.get(url, stream=True, timeout=60)
+                      r.raise_for_status()
+                      raw = unquote(urlparse(url).path.split("/")[-1])
+                      fname = raw if (raw and "." in raw) else f"video_{i}.mp4"
+                      dest = DOWNLOAD_DIR / fname
+                      total = int(r.headers.get("content-length", 0))
+                      done = 0
+                      with open(dest, "wb") as f:
+                          for chunk in r.iter_content(1024 * 1024):
+                              f.write(chunk)
+                              done += len(chunk)
+                              if total:
+                                  print(f"\r  ⬇️  {done/total*100:.1f}% ({done//1024//1024} MB)", end="", flush=True)
+                      print()
+                      downloaded.append((dest, dest.stem))
+                      print(f"  ✅ {dest.name} ({dest.stat().st_size//1024//1024} MB)")
+                  except Exception as e:
+                      print(f"  ❌ Error: {e}")
+
+          if not downloaded:
+              print("\n❌ কোনো video download হয়নি!")
+              sys.exit(1)
+
+          # ── Compress if needed ────────────────────────────
+          ready_files = []
+          for path, title in downloaded:
+              print(f"\n🔍 {path.name} ({path.stat().st_size//1024//1024} MB)")
+              final = compress_if_needed(path)
+              ready_files.append((final, title))
+              print(f"  → {final.name} ({final.stat().st_size//1024//1024} MB) ✅")
+
+          # ── ZIP ───────────────────────────────────────────
+          ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+          zip_name = f"videos_{ts}.zip"
+          zip_path = Path(f"/tmp/{zip_name}")
+          print(f"\n📦 Zipping {len(ready_files)} file(s)...")
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+              for fpath, _ in ready_files:
+                  zf.write(fpath, fpath.name)
+                  print(f"  + {fpath.name}")
+          print(f"✅ ZIP: {zip_path.stat().st_size//1024//1024} MB\n")
+
+          # ── Create GitHub Release ─────────────────────────
+          tag = f"videos-{ts}-{uuid.uuid4().hex[:6]}"
+          titles_str = " | ".join(t for _, t in ready_files)[:80]
+
+          print(f"🚀 Creating release: {tag}")
+          rel = requests.post(
+              f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases",
+              headers=GH_HEADERS,
+              json={
+                  "tag_name": tag,
+                  "name": f"🎬 {titles_str}",
+                  "body": "\n".join(f"- {t}" for _, t in ready_files) +
+                          f"\n\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                  "draft": False,
+                  "prerelease": False
+              })
+
+          if rel.status_code != 201:
+              print(f"❌ Release failed: {rel.status_code}\n{rel.text[:300]}")
+              sys.exit(1)
+
+          # ── Upload ZIP ────────────────────────────────────
+          upload_url = rel.json()["upload_url"].split("{")[0] + f"?name={zip_name}"
+          release_url = rel.json()["html_url"]
+          zip_size = zip_path.stat().st_size
+
+          print(f"⬆️  Uploading {zip_size//1024//1024} MB...")
+          with open(zip_path, "rb") as f:
+              up = requests.post(
+                  upload_url,
+                  headers={"Authorization": f"token {GH_TOKEN}",
+                           "Content-Type": "application/octet-stream"},
+                  data=f)
+
+          if up.status_code != 201:
+              print(f"❌ Upload failed: {up.status_code}\n{up.text[:300]}")
+              sys.exit(1)
+
+          zip_download_url = up.json()["browser_download_url"]
+          print(f"✅ Uploaded!\n   {zip_download_url}\n")
+
+          # ── Update videos.txt in repo ─────────────────────
+          bd = datetime.utcnow() + timedelta(hours=6)  # Bangladesh time
+          new_entry = (
+              f"{'─'*60}\n"
+              f"📅 {bd.strftime('%d %B %Y')}  🕐 {bd.strftime('%I:%M %p')}\n"
+              f"📦 ZIP Download : {zip_download_url}\n"
+              f"🔗 Release Page : {release_url}\n"
+              f"🎬 Videos ({len(ready_files)}):\n"
+          )
+          for _, title in ready_files:
+              new_entry += f"   • {title}\n"
+          new_entry += "\n"
+
+          # Read existing videos.txt (if any)
+          existing = ""
+          try:
+              with open("videos.txt", "r") as f:
+                  existing = f.read()
+          except FileNotFoundError:
+              existing = ""
+
+          # Prepend new entry (latest on top)
+          with open("videos.txt", "w") as f:
+              f.write(new_entry + existing)
+
+          print("📝 videos.txt updated!")
+          print(new_entry)
+
+          # ── Write summary for GitHub Actions ─────────────
+          summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary:
+              with open(summary, "w") as f:
+                  f.write(f"## ✅ Download Complete\n\n")
+                  f.write(f"| | |\n|---|---|\n")
+                  f.write(f"| 📦 ZIP | [{zip_name}]({zip_download_url}) |\n")
+                  f.write(f"| 🔗 Release | [View]({release_url}) |\n")
+                  f.write(f"| 🎬 Videos | {len(ready_files)} |\n")
+                  f.write(f"| 💾 Size | {zip_size//1024//1024} MB |\n\n")
+                  for _, t in ready_files:
+                      f.write(f"- {t}\n")
+
+          PYEOF
+
+      - name: 📝 Commit videos.txt to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add videos.txt
+          git diff --cached --quiet || git commit -m "🎬 videos.txt updated [$(date +'%Y-%m-%d %H:%M')]"
+          git push
